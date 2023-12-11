@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import fire
 import json
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
 from sentencepiece import SentencePieceProcessor
 
 
@@ -21,6 +21,8 @@ class ModelArgs:
     vocab_size: int
 
     max_batch_size: int = 0
+    device: str = "cpu"
+    dtype: Any = torch.bfloat16
 
 
 def repeat_kv(keys: torch.Tensor, values: torch.Tensor, repeats: int):
@@ -96,16 +98,19 @@ class Attention(nn.Module):
                 args.sliding_window,
                 self.n_kv_heads,
                 self.args.head_dim,
-            ), dtype=torch.float16
-        ).cuda()
+            ), dtype=args.dtype
+        )
         self.cache_v = torch.empty(
             (
                 args.max_batch_size,
                 args.sliding_window,
                 self.n_kv_heads,
                 self.args.head_dim,
-            ), dtype=torch.float16
-        ).cuda()
+            ), dtype=args.dtype
+        )
+        if args.device == "cuda":
+            self.cache_k = self.cache_k.cuda()
+            self.cache_v = self.cache_v.cuda()            
 
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, positions: torch.Tensor, mask: Optional[torch.Tensor]
@@ -236,7 +241,7 @@ class Transformer(nn.Module):
             bias=False
         )
 
-        self.freqs_cis = precompute_freqs_cis(self.args.head_dim, 128_000).to("cuda")
+        self.freqs_cis = precompute_freqs_cis(self.args.head_dim, 128_000).to(args.device)
 
 
     def forward(
@@ -267,10 +272,21 @@ class Transformer(nn.Module):
         return self.output(self.norm(h)).float()
 
     @staticmethod
-    def from_folder(folder: Path, max_batch_size: int = 1, device="cuda", dtype=torch.float16):
+    def from_folder(folder: Path, max_batch_size: int = 1, device=None):
+        if device is None:
+            device = "cpu"
+        if device=="cpu":
+          dtype=torch.bfloat16
+        elif device=="cuda":
+          dtype=torch.float16            
+          
         with open(folder / 'params.json', 'r') as f:
             model_args = ModelArgs(**json.loads(f.read()))
+
         model_args.max_batch_size = max_batch_size
+        model_args.device = device
+        model_args.dtype = dtype
+        
         model = Transformer(model_args).to(device=device, dtype=dtype)
         loaded = torch.load(folder / 'consolidated.00.pth')
         model.load_state_dict(loaded)
@@ -299,19 +315,20 @@ class Tokenizer:
 
 
 @torch.no_grad()
-def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, max_tokens: int):
+def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, max_tokens: int, device=None):
+    device=model.args.device
     encoded_prompts = [tokenizer.encode(prompt) for prompt in prompts]
     prompt_lens = [len(x) for x in encoded_prompts]
     min_prompt_len = min(prompt_lens)
     max_prompt_len = max(prompt_lens)
 
-    input_tokens = torch.full((len(prompts), max_prompt_len), tokenizer.pad_id, dtype=torch.long, device="cuda")
+    input_tokens = torch.full((len(prompts), max_prompt_len), tokenizer.pad_id, dtype=torch.long, device=device)
     for i, encoded in enumerate(encoded_prompts):
         input_tokens[i, :len(encoded)] = torch.tensor(encoded).to(input_tokens)
     input_mask = input_tokens != tokenizer.pad_id
 
     # pre-fill
-    positions = torch.arange(0, min_prompt_len).to("cuda")
+    positions = torch.arange(0, min_prompt_len).to(device)
     logits = model.forward(input_tokens[:, :min_prompt_len], positions)
     logprobs = nn.functional.log_softmax(logits, dim=-1)
 
